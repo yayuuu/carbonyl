@@ -1,11 +1,12 @@
-use std::io::{self, Stdout, Write};
+use std::io::{self, Write};
+use std::os::fd::FromRawFd;
 
 use crate::gfx::{Color, Point};
 
-use super::{binarize_quandrant, Cell};
+use super::Cell;
 
 pub struct Painter {
-    output: Stdout,
+    output: Box<dyn Write + Send>,
     buffer: Vec<u8>,
     cursor: Option<Point<u32>>,
     true_color: bool,
@@ -16,11 +17,14 @@ pub struct Painter {
 }
 
 impl Painter {
-    pub fn new() -> Painter {
+    pub fn new() -> Painter { Self::new_fd(1) }
+    pub fn new_fd(fd: i32) -> Painter {
+        let output = if fd == 1 { Box::new(io::stdout()) as Box<dyn Write + Send> }
+            else { let copy = unsafe { libc::dup(fd) }; assert!(copy >= 0); Box::new(unsafe { std::fs::File::from_raw_fd(copy) }) };
         Painter {
             buffer: Vec::new(),
             cursor: None,
-            output: io::stdout(),
+            output,
             background: None,
             foreground: None,
             background_code: None,
@@ -32,6 +36,9 @@ impl Painter {
         }
     }
 
+    pub fn escape(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.output.write_all(bytes)?; self.output.flush()
+    }
     pub fn true_color(&self) -> bool {
         self.true_color
     }
@@ -54,7 +61,7 @@ impl Painter {
             )?;
         }
 
-        self.output.write(self.buffer.as_slice())?;
+        self.output.write_all(self.buffer.as_slice())?;
         self.output.flush()?;
         self.buffer.clear();
         self.cursor = None;
@@ -66,9 +73,11 @@ impl Painter {
         let &Cell {
             cursor,
             quadrant,
+            graphic,
             ref grapheme,
         } = cell;
 
+        let mut encoded = [0; 4];
         let (char, background, foreground, width) = if let Some(grapheme) = grapheme {
             if grapheme.index > 0 {
                 return Ok(());
@@ -85,9 +94,8 @@ impl Painter {
                 grapheme.width as u32,
             )
         } else {
-            let (char, background, foreground) = binarize_quandrant(quadrant);
-
-            (char, background, foreground, 1)
+            (graphic.character.encode_utf8(&mut encoded) as &str,
+             graphic.background, graphic.foreground, 1)
         };
 
         if self.cursor != Some(cursor) {

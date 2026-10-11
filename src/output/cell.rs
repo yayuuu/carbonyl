@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use crate::gfx::{Color, Point};
+use super::Graphic;
 
 #[derive(Clone, PartialEq)]
 pub struct Grapheme {
@@ -12,12 +13,13 @@ pub struct Grapheme {
 }
 
 /// Terminal cell with `height = width * 2`
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Cell {
     pub cursor: Point<u32>,
     /// Text grapheme if any
     pub grapheme: Option<Rc<Grapheme>>,
     pub quadrant: (Color, Color, Color, Color),
+    pub graphic: Graphic,
 }
 
 impl Cell {
@@ -25,6 +27,7 @@ impl Cell {
         Cell {
             cursor: Point::new(x, y),
             grapheme: None,
+            graphic: Graphic::solid(Color::black()),
             quadrant: (
                 Color::black(),
                 Color::black(),

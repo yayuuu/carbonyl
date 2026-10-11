@@ -32,7 +32,8 @@ impl Keyboard {
         }
     }
     pub fn key(key: u8, modifiers: u8) -> Option<Event> {
-        let modifiers = KeyModifiers::parse(modifiers);
+        let mut modifiers = KeyModifiers::parse(modifiers);
+        if key==b'Z' {modifiers.shift=true;return Some(Event::KeyPress{key:Key{char:9,modifiers}});}
         let char = match key {
             // Up
             b'A' => 0x11,

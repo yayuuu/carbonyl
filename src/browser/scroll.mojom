@@ -1,0 +1,6 @@
+module carbonyl.mojom;
+interface ScrollController { SetOffset(float offset); };
+interface ScrollService {
+    BindController(pending_remote<ScrollController> controller);
+    Update(float offset, float viewport, float content);
+};

@@ -50,6 +50,7 @@ pub struct RendererBridge {
     cmd: CommandLine,
     window: Window,
     renderer: RenderThread,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for RendererBridge {}
@@ -100,7 +101,11 @@ pub struct BrowserDelegate {
     mouse_up: extern "C" fn(c_uint, c_uint),
     mouse_down: extern "C" fn(c_uint, c_uint),
     mouse_move: extern "C" fn(c_uint, c_uint),
-    post_task: extern "C" fn(extern "C" fn(*mut c_void), *mut c_void),
+    post_task: extern "C" fn(usize, extern "C" fn(*mut c_void), *mut c_void),
+    scroll_to: extern "C" fn(c_float),
+    dialog_action: extern "C" fn(u64, c_int, c_int, *const c_char),
+    clipboard_text: extern "C" fn(*const c_char, bool),
+    context:usize,
 }
 
 fn main() -> io::Result<Option<i32>> {
@@ -112,9 +117,46 @@ fn main() -> io::Result<Option<i32>> {
     if cmd.shell_mode {
         return Ok(None);
     }
+    if env::var("CARBONYL_CHROME_BACKEND").as_deref() == Ok("1") {
+        return super::session::run(cmd).map(Some);
+    }
 
     let mut terminal = input::Terminal::setup();
     let mut command = Command::new(env::current_exe()?);
+    // Carbonyl transfers the graphics-only software surface to the terminal.
+    command.arg("--disable-gpu-compositing").arg("--hide-scrollbars");
+    if env::var("CARBONYL_CHROME_BACKEND").as_deref() == Ok("1") {
+        let window = Window::read();
+        let width = (window.browser.width as f32 * window.dpi).ceil() as u32;
+        let height = (window.browser.height as f32 * window.dpi).ceil() as u32;
+        command
+            .arg("--ozone-platform=headless")
+            .arg(format!("--ozone-override-screen-size={},{}", width, height))
+            .arg("--kiosk")
+            .arg("--start-fullscreen")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--password-store=basic")
+            .arg("--use-angle=swiftshader");
+    }
+
+    // Carbonyl is an interactive browser. headless_shell otherwise advertises
+    // navigator.webdriver=true, which breaks YouTube playback attestation.
+    command.arg("--disable-blink-features=AutomationControlled");
+
+    if !cmd.args.iter().any(|arg| arg == "--user-data-dir" || arg.starts_with("--user-data-dir=")) {
+        let profile = env::var_os("CARBONYL_PROFILE_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let data = env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from(env::var_os("HOME").unwrap_or_default())
+                        .join(".local/share"));
+                data.join("carbonyl/profile")
+            });
+        std::fs::create_dir_all(&profile)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700))?;
+        command.arg(format!("--user-data-dir={}", profile.display()));
+    }
 
     if !cmd.bitmap {
         command
@@ -143,8 +185,10 @@ fn main() -> io::Result<Option<i32>> {
 
 #[no_mangle]
 pub extern "C" fn carbonyl_bridge_main() {
-    if let Some(code) = main().unwrap() {
-        std::process::exit(code)
+    match main() {
+        Ok(Some(code))=>std::process::exit(code),
+        Ok(None)=>(),
+        Err(error)=>{eprintln!("Carbonyl: {error}");std::process::exit(1);}
     }
 }
 
@@ -159,16 +203,31 @@ pub extern "C" fn carbonyl_bridge_get_dpi() -> c_float {
 }
 
 #[no_mangle]
-pub extern "C" fn carbonyl_renderer_create() -> RendererPtr {
+pub extern "C" fn carbonyl_renderer_create() -> RendererPtr { carbonyl_renderer_create_terminal(1) }
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_create_terminal(fd:c_int) -> RendererPtr {
     let bridge = RendererBridge {
         cmd: CommandLine::parse(),
-        window: Window::read(),
-        renderer: RenderThread::new(),
+        window: Window::read_fd(fd),
+        renderer: RenderThread::new_fd(fd),
+        stopped:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     Box::into_raw(Box::new(Mutex::new(bridge)))
 }
 
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_stop(bridge:RendererPtr) {
+    let bridge=unsafe {&*bridge};
+    let handle={let mut b=bridge.lock().unwrap();
+        b.stopped.store(true,std::sync::atomic::Ordering::Relaxed);b.renderer.stop()};
+    if let Some(handle)=handle {let _=handle.join();}
+}
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_changed(bridge:RendererPtr)->bool {
+    let bridge=unsafe {&*bridge}; let mut b=bridge.lock().unwrap();
+    let old=b.window.cells; b.window.update(); old!=b.window.cells
+}
 #[no_mangle]
 pub extern "C" fn carbonyl_renderer_start(bridge: RendererPtr) {
     {
@@ -292,6 +351,54 @@ pub extern "C" fn carbonyl_renderer_draw_bitmap(
 }
 
 #[no_mangle]
+pub extern "C" fn carbonyl_renderer_update_scroll(bridge: RendererPtr, offset: c_float, viewport: c_float, content: c_float) {
+    let bridge = unsafe { bridge.as_ref() }.unwrap();
+    bridge.lock().unwrap().renderer.render(move |renderer| renderer.update_scroll(offset, viewport, content));
+}
+
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_download_status(bridge: RendererPtr, text: *const c_char) {
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    unsafe { bridge.as_ref() }.unwrap().lock().unwrap().renderer.render(move |renderer| {
+        renderer.set_download_status(text.clone());
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_clipboard_write(bridge:RendererPtr,text:*const c_char) {
+    let encoded=unsafe{CStr::from_ptr(text)}.to_string_lossy().into_owned();
+    unsafe{bridge.as_ref()}.unwrap().lock().unwrap().renderer.render(move|renderer|{
+        renderer.write_clipboard(&encoded).unwrap();
+    });
+}
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_clipboard_query(bridge:RendererPtr) {
+    unsafe{bridge.as_ref()}.unwrap().lock().unwrap().renderer.render(|renderer|{
+        renderer.query_clipboard().unwrap();
+    });
+}
+#[repr(C)]
+pub struct CDialogControl {
+    id:c_int, kind:c_int, label:*const c_char, value:*const c_char, flags:c_uint,
+}
+#[no_mangle]
+pub extern "C" fn carbonyl_renderer_show_dialog(bridge:RendererPtr,id:u64,title:*const c_char,
+    controls:*const CDialogControl,count:size_t) {
+    let title=unsafe { CStr::from_ptr(title) }.to_string_lossy().into_owned();
+    let controls=if count==0 {Vec::new()} else {
+        unsafe { std::slice::from_raw_parts(controls,count) }.iter().map(|c|crate::ui::dialog::Control{
+            id:c.id,kind:c.kind,flags:c.flags,
+            label:unsafe {CStr::from_ptr(c.label)}.to_string_lossy().into_owned(),
+            value:unsafe {CStr::from_ptr(c.value)}.to_string_lossy().into_owned(),
+        }).collect()
+    };
+    let mut controls=Some(controls);
+    unsafe {bridge.as_ref()}.unwrap().lock().unwrap().renderer.render(move|renderer|{
+        renderer.update_dialog(id,title.clone(),controls.take().unwrap());
+    });
+}
+
+#[no_mangle]
 pub extern "C" fn carbonyl_renderer_get_size(bridge: RendererPtr) -> CSize {
     let bridge = unsafe { bridge.as_ref() };
     let bridge = bridge.unwrap().lock().unwrap();
@@ -307,13 +414,13 @@ extern "C" fn post_task_handler(callback: *mut c_void) {
     closure()
 }
 
-unsafe fn post_task<F>(handle: extern "C" fn(extern "C" fn(*mut c_void), *mut c_void), run: F)
+unsafe fn post_task<F>(context:usize, handle: extern "C" fn(usize, extern "C" fn(*mut c_void), *mut c_void), run: F)
 where
     F: FnMut() + Send + 'static,
 {
     let closure: *mut Box<dyn FnMut()> = Box::into_raw(Box::new(Box::new(run)));
 
-    handle(post_task_handler, closure as *mut c_void);
+    handle(context, post_task_handler, closure as *mut c_void);
 }
 
 /// Function called by the C++ code to listen for input events.
@@ -327,6 +434,7 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
 
     use input::*;
 
+    let (fd,stop)={let b=bridge.lock().unwrap();(b.window.fd,b.stopped.clone())};
     thread::spawn(move || {
         macro_rules! emit {
             ($event:ident($($args:expr),*) => $closure:expr) => {{
@@ -336,14 +444,14 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
                     $closure
                 };
 
-                unsafe { post_task(delegate.post_task, run) }
+                unsafe { post_task(delegate.context, delegate.post_task, run) }
             }};
             ($event:ident($($args:expr),*)) => {{
                 emit!($event($($args),*) => {})
             }};
         }
 
-        listen(|mut events| {
+        let _=listen_fd(if fd==1 {0}else{fd},&stop,|mut events| {
             bridge.lock().unwrap().renderer.render(move |renderer| {
                 let get_scale = || bridge.lock().unwrap().window.scale;
                 let scale = |col, row| {
@@ -358,6 +466,20 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
                 let dispatch = |action| {
                     match action {
                         NavigationAction::Ignore => (),
+                        NavigationAction::DialogAction(id, control, action, value) => {
+                            let value=CString::new(value).unwrap();
+                            emit!(dialog_action(id,control,action,value.as_ptr()))
+                        },
+                        NavigationAction::Paste(text)=> {
+                            let text=CString::new(text.replace('\0',"")).unwrap();
+                            emit!(clipboard_text(text.as_ptr(),false))
+                        },
+                        NavigationAction::Click(point) => {
+                            let (width, height) = scale(point.x as usize, point.y as usize);
+                            emit!(mouse_down(width, height));
+                            emit!(mouse_up(width, height));
+                        },
+                        NavigationAction::ScrollTo(offset) => emit!(scroll_to(offset)),
                         NavigationAction::Forward => return true,
                         NavigationAction::GoBack() => emit!(go_back()),
                         NavigationAction::GoForward() => emit!(go_forward()),
@@ -376,8 +498,29 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
                     use Event::*;
 
                     match event {
-                        Exit => (),
+                        Clipboard(text) => {
+                            let copy = CString::new(text.replace('\0', "")).unwrap();
+                            emit!(clipboard_text(copy.as_ptr(), true));
+                            dispatch(renderer.clipboard_reply(&text));
+                        },
+                        Paste { text } => {
+                            let text = text.replace('\0', "");
+                            let copy = CString::new(text.clone()).unwrap();
+                            emit!(clipboard_text(copy.as_ptr(), true));
+                            dispatch(renderer.paste(&text));
+                        },
+                        Exit => {
+                            if renderer.has_selection() {
+                                if let Some(text) = renderer.copy_selection().unwrap() {
+                                    let copy = CString::new(text.replace('\0', "")).unwrap();
+                                    emit!(clipboard_text(copy.as_ptr(), true));
+                                }
+                            } else if renderer.dialog_open() {
+                                dispatch(renderer.keypress(&Key::from(0x1b)).unwrap());
+                            } else { emit!(shutdown()); }
+                        },
                         Scroll { delta } => {
+                            if renderer.dialog_open() { continue; }
                             let scale = get_scale();
 
                             emit!(scroll((delta as f32 * scale.height) as c_int))
@@ -415,8 +558,8 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
                     }
                 }
             })
-        })
-        .unwrap();
+        });
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {return;}
 
         // Setup single-use channel
         let (tx, rx) = mpsc::channel();

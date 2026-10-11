@@ -10,12 +10,17 @@ mojom("mojom") {
   ]
 }
 
+mojom("scroll_mojom") {
+  sources = [ "scroll.mojom" ]
+}
+
 component("bridge") {
   output_name = "carbonyl_bridge"
   defines = [ "CARBONYL_BRIDGE_IMPLEMENTATION" ]
   sources = [
     "bridge.cc",
     "bridge.h",
+    "native_text.h",
   ]
 }
 
@@ -70,5 +75,24 @@ component("renderer") {
     ":bridge",
     "//base",
     "//skia"
+  ]
+}
+
+source_set("input") {
+  sources = [ "browser_input.cc", "browser_input.h", "portal_file_dialog.cc", "portal_file_dialog.h" ]
+  deps = [
+    ":renderer",
+    ":scroll_mojom",
+    "//base",
+    "//components/input",
+    "//content/public/browser",
+    "//net",
+    "//ui/shell_dialogs",
+    "//third_party/blink/public:blink_headers",
+    "//ui/base",
+    "//ui/aura",
+    "//ui/events",
+    "//ui/gfx/geometry",
+    "//url",
   ]
 }

@@ -3,22 +3,19 @@
 
 #include <memory>
 
-#include "base/callback.h"
+#include "base/functional/callback.h"
 #include "base/memory/shared_memory_mapping.h"
 #include "carbonyl/src/browser/export.h"
 #include "components/viz/host/host_display_client.h"
 #include "services/viz/privileged/mojom/compositing/layered_window_updater.mojom.h"
-#include "ui/gfx/native_widget_types.h"
+#include "ui/gfx/native_ui_types.h"
 
 namespace carbonyl {
-
-typedef base::RepeatingCallback<void(const gfx::Rect&, const SkBitmap&)>
-    OnPaintCallback;
 
 class CARBONYL_VIZ_EXPORT LayeredWindowUpdater : public viz::mojom::LayeredWindowUpdater {
  public:
   explicit LayeredWindowUpdater(
-      mojo::PendingReceiver<viz::mojom::LayeredWindowUpdater> receiver);
+      mojo::PendingReceiver<viz::mojom::LayeredWindowUpdater> receiver, gfx::AcceleratedWidget widget);
   ~LayeredWindowUpdater() override;
 
   // disable copy
@@ -31,17 +28,16 @@ class CARBONYL_VIZ_EXPORT LayeredWindowUpdater : public viz::mojom::LayeredWindo
   void Draw(const gfx::Rect& damage_rect, DrawCallback draw_callback) override;
 
  private:
+  gfx::AcceleratedWidget widget_;
   mojo::Receiver<viz::mojom::LayeredWindowUpdater> receiver_;
-  base::WritableSharedMemoryMapping shm_mapping_;
+  std::shared_ptr<base::WritableSharedMemoryMapping> shm_mapping_;
   gfx::Size pixel_size_;
-  DrawCallback callback_;
   scoped_refptr<base::SingleThreadTaskRunner> task_runner_;
-  base::WeakPtrFactory<LayeredWindowUpdater> weak_ptr_factory_ { this };
 };
 
 class CARBONYL_VIZ_EXPORT HostDisplayClient : public viz::HostDisplayClient {
  public:
-  explicit HostDisplayClient();
+  explicit HostDisplayClient(gfx::AcceleratedWidget widget = gfx::kNullAcceleratedWidget);
   ~HostDisplayClient() override;
 
   // disable copy
@@ -59,12 +55,12 @@ class CARBONYL_VIZ_EXPORT HostDisplayClient : public viz::HostDisplayClient {
       mojo::PendingReceiver<viz::mojom::LayeredWindowUpdater> receiver)
       override;
 
-#if BUILDFLAG(IS_LINUX) && !BUILDFLAG(IS_CHROMEOS)
+#if BUILDFLAG(IS_LINUX) && BUILDFLAG(SUPPORTS_OZONE_X11)
   void DidCompleteSwapWithNewSize(const gfx::Size& size) override;
 #endif
 
+  gfx::AcceleratedWidget widget_;
   std::unique_ptr<LayeredWindowUpdater> layered_window_updater_;
-  OnPaintCallback callback_;
 };
 
 }  // namespace carbonyl

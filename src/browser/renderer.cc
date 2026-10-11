@@ -1,6 +1,8 @@
 #include "carbonyl/src/browser/renderer.h"
 
 #include <memory>
+#include <map>
+#include <mutex>
 #include <iostream>
 #include <stdio.h>
 
@@ -39,11 +41,20 @@ bool carbonyl_bridge_bitmap_mode();
 float carbonyl_bridge_get_dpi();
 
 struct carbonyl_renderer* carbonyl_renderer_create();
+struct carbonyl_renderer* carbonyl_renderer_create_terminal(int fd);
+void carbonyl_renderer_stop(struct carbonyl_renderer*);
+bool carbonyl_renderer_changed(struct carbonyl_renderer*);
 void carbonyl_renderer_start(struct carbonyl_renderer* renderer);
 void carbonyl_renderer_resize(struct carbonyl_renderer* renderer);
 struct carbonyl_renderer_size carbonyl_renderer_get_size(struct carbonyl_renderer* renderer);
 void carbonyl_renderer_push_nav(struct carbonyl_renderer* renderer, const char* url, bool can_go_back, bool can_go_forward);
 void carbonyl_renderer_set_title(struct carbonyl_renderer* renderer, const char* title);
+void carbonyl_renderer_update_scroll(struct carbonyl_renderer*, float, float, float);
+void carbonyl_renderer_show_dialog(struct carbonyl_renderer*, uint64_t, const char*,
+                                    const carbonyl_dialog_control*, size_t);
+void carbonyl_renderer_clipboard_write(struct carbonyl_renderer*, const char*);
+void carbonyl_renderer_clipboard_query(struct carbonyl_renderer*);
+void carbonyl_renderer_download_status(struct carbonyl_renderer*, const char*);
 void carbonyl_renderer_clear_text(struct carbonyl_renderer* renderer);
 void carbonyl_renderer_listen(struct carbonyl_renderer* renderer, const struct carbonyl_renderer_browser_delegate* delegate);
 void carbonyl_renderer_draw_text(
@@ -66,6 +77,10 @@ namespace carbonyl {
 
 namespace {
     static std::unique_ptr<Renderer> globalInstance;
+    thread_local Renderer* scoped = nullptr;
+    Renderer* last_active = nullptr;
+    std::map<gfx::AcceleratedWidget, Renderer*> terminals;
+    std::mutex terminals_mutex;
 }
 
 Renderer::Renderer(struct carbonyl_renderer* ptr): ptr_(ptr) {}
@@ -80,6 +95,8 @@ void Renderer::Main() {
 }
 
 Renderer* Renderer::GetCurrent() {
+    if (scoped) return scoped;
+    if (last_active) return last_active;
     if (!globalInstance) {
         globalInstance = std::unique_ptr<Renderer>(
             new Renderer(carbonyl_renderer_create())
@@ -89,7 +106,32 @@ Renderer* Renderer::GetCurrent() {
     return globalInstance.get();
 }
 
+Renderer* Renderer::CreateTerminal(int fd) {
+    // Kept for process lifetime: Viz and posted input callbacks may still refer
+    // to a terminal after its browser window closes.
+    return new Renderer(carbonyl_renderer_create_terminal(fd));
+}
+Renderer::Scope::Scope(Renderer* renderer, bool active) : previous_(scoped) {
+    scoped = renderer; if (active) last_active = renderer;
+}
+Renderer::Scope::~Scope() { scoped = previous_; }
+Renderer* Renderer::ForWidget(gfx::AcceleratedWidget widget) {
+    std::lock_guard<std::mutex> lock(terminals_mutex);
+    auto it = terminals.find(widget);
+    return it == terminals.end() ? nullptr : it->second;
+}
+void Renderer::BindWidget(gfx::AcceleratedWidget widget) {
+    std::lock_guard<std::mutex> lock(terminals_mutex); terminals[widget] = this;
+}
+void Renderer::Stop() {
+    started_ = false; carbonyl_renderer_stop(ptr_);
+    std::lock_guard<std::mutex> lock(terminals_mutex);
+    std::erase_if(terminals, [this](const auto& entry) {return entry.second == this;});
+    if (last_active == this) last_active = terminals.empty() ? nullptr : terminals.begin()->second;
+}
+bool Renderer::SizeChanged() { return carbonyl_renderer_changed(ptr_); }
 void Renderer::StartRenderer() {
+    started_ = true;
     carbonyl_renderer_start(ptr_);
 }
 
@@ -126,6 +168,21 @@ void Renderer::SetTitle(const std::string& title) {
     carbonyl_renderer_set_title(ptr_, title.c_str());
 }
 
+void Renderer::UpdateScroll(float offset, float viewport, float content) {
+    carbonyl_renderer_update_scroll(ptr_, offset, viewport, content);
+}
+
+void Renderer::SetDownloadStatus(const std::string& text) { carbonyl_renderer_download_status(ptr_, text.c_str()); }
+
+void Renderer::WriteClipboard(const std::string& encoded) {
+    carbonyl_renderer_clipboard_write(ptr_, encoded.c_str());
+}
+void Renderer::QueryClipboard() { carbonyl_renderer_clipboard_query(ptr_); }
+void Renderer::ShowDialog(uint64_t id, const std::string& title,
+                          const std::vector<carbonyl_dialog_control>& controls) {
+    carbonyl_renderer_show_dialog(ptr_, id, title.c_str(), controls.data(), controls.size());
+}
+
 void Renderer::DrawText(const std::vector<Text>& text) {
     struct carbonyl_renderer_text data[text.size()];
 
@@ -149,6 +206,7 @@ void Renderer::DrawBitmap(
     const gfx::Rect& damage,
     base::OnceCallback<void()> callback
 ) {
+    if (!started_) { std::move(callback).Run(); return; }
     auto* box = new base::OnceCallback<void()>(std::move(callback));
 
     carbonyl_renderer_draw_bitmap(

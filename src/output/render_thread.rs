@@ -14,6 +14,7 @@ use super::{FrameSync, Renderer};
 pub struct RenderThread {
     thread: Option<(Sender<Message>, JoinHandle<()>)>,
     enabled: bool,
+    fd:i32,
 }
 
 type RenderClosure = Box<dyn FnMut(&mut Renderer) + Send>;
@@ -23,8 +24,10 @@ enum Message {
 }
 
 impl RenderThread {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::new_fd(1) }
+    pub fn new_fd(fd:i32) -> Self {
         Self {
+            fd,
             thread: None,
             enabled: false,
         }
@@ -56,10 +59,10 @@ impl RenderThread {
     }
 
     /// Boot the rendering thread, contains a simple event loop.
-    fn boot(rx: Receiver<Message>) {
+    fn boot(rx: Receiver<Message>, fd:i32) {
         let cmd = CommandLine::parse();
         let mut sync = FrameSync::new(cmd.fps);
-        let mut renderer = Renderer::new();
+        let mut renderer = Renderer::new_fd(fd);
         let mut needs_render = false;
 
         loop {
@@ -100,7 +103,7 @@ impl RenderThread {
 
                 // Update the frame sync timings
                 sync.start();
-                renderer.render().unwrap();
+                if renderer.render().is_err() { needs_render = false; }
             }
         }
     }
@@ -115,7 +118,8 @@ impl RenderThread {
 
             tx.send(message).unwrap();
 
-            self.thread = Some((tx.clone(), thread::spawn(move || Self::boot(rx))));
+            let fd=self.fd;
+            self.thread = Some((tx.clone(), thread::spawn(move || Self::boot(rx,fd))));
         }
     }
 }

@@ -10,3 +10,29 @@ node_modules/
 !/chromium/depot_tools
 !/chromium/patches
 /packages/*/build
+
+# Local regression harnesses depend on this machine's desktop and test tools.
+/tests/
+/scripts/*-diagnostic.py
+
+# Build output, runtime captures and generated caches.
+*.log
+*.o
+*.a
+*.so
+*.so.*
+*.deb
+*.tar.gz
+*.tar.xz
+*.tar.zst
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+target/
+
+# Editor state and temporary/backup files.
+*.swp
+*.swo
+*~
+*.before-*

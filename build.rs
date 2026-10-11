@@ -1,44 +1,32 @@
-use std::path::PathBuf;
-
-#[cfg(target_arch = "x86_64")]
-fn link_sysroot() {
-    let sysroot_path = PathBuf::from("./chromium/src/build/linux/debian_bullseye_amd64-sysroot");
-
-    if sysroot_path.is_dir() {
-        println!("cargo:rustc-link-search=chromium/src/build/linux/debian_bullseye_amd64-sysroot/lib/x86_64-linux-gnu");
-        println!("cargo:rustc-link-search=chromium/src/build/linux/debian_bullseye_amd64-sysroot/usr/lib/x86_64-linux-gnu");
-
-        println!(
-            "cargo:rustc-link-arg=--sysroot=./chromium/src/build/linux/debian_bullseye_amd64-sysroot"
-        );
-    } else {
-        println!("cargo:warning={}", "x86_64 debian sysroot provided by chromium was not found!");
-        println!("cargo:warning={}", "carbonyl may fail to link against a proper libc!");
-    }
-}
-
-#[cfg(target_arch = "x86")]
-fn link_sysroot() {
-    let sysroot_path = PathBuf::from("./chromium/src/build/linux/debian_bullseye_i386-sysroot");
-
-    if sysroot_path.is_dir() {
-        println!("cargo:rustc-link-search=chromium/src/build/linux/debian_bullseye_i386-sysroot/lib/i386-linux-gnu");
-        println!("cargo:rustc-link-search=chromium/src/build/linux/debian_bullseye_i386-sysroot/usr/lib/i386-linux-gnu");
-
-        println!(
-            "cargo:rustc-link-arg=--sysroot=./chromium/src/build/linux/debian_bullseye_i386-sysroot"
-        );
-    } else {
-        println!("cargo:warning={}", "x86 debian sysroot provided by chromium was not found!");
-        println!("cargo:warning={}", "carbonyl may fail to link against a proper libc!");
-    }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-fn link_sysroot() {
-    // Intentionally left blank.
-}
+use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    link_sysroot();
+    println!("cargo:rerun-if-changed=src/output/chafa.c");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG");
+    let pkg = env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
+    let flags = Command::new(&pkg).args(["--cflags", "chafa >= 1.8"]).output()
+        .expect("pkg-config is required to build Carbonyl with chafa");
+    assert!(flags.status.success(), "Install libchafa-dev >= 1.8: {}",
+            String::from_utf8_lossy(&flags.stderr));
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let object = out.join("carbonyl_chafa.o");
+    let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-O2", "-fPIC", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .args(String::from_utf8(flags.stdout).unwrap().split_whitespace())
+        .args(["-c", "src/output/chafa.c", "-o"]).arg(&object).status().unwrap();
+    assert!(status.success(), "Failed to compile chafa bridge");
+    assert!(Command::new("ar").arg("crs").arg(out.join("libcarbonyl_chafa.a"))
+        .arg(&object).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=carbonyl_chafa");
+    let libs = Command::new(&pkg).args(["--libs", "chafa"]).output().unwrap();
+    assert!(libs.status.success());
+    for flag in String::from_utf8(libs.stdout).unwrap().split_whitespace() {
+        if let Some(lib) = flag.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib={lib}");
+        } else if let Some(path) = flag.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={path}");
+        }
+    }
 }

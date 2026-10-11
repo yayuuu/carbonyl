@@ -1,0 +1,30 @@
+diff --git a/src/core/SkBitmapDevice.cpp b/src/core/SkBitmapDevice.cpp
+index 2209808..a34d6b8 100644
+--- a/src/core/SkBitmapDevice.cpp
++++ b/src/core/SkBitmapDevice.cpp
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include "src/core/SkBitmapDevice.h"
++#include "carbonyl/src/browser/bridge.h"
++#include "carbonyl/src/browser/native_text.h"
+ 
+ #include "include/core/SkAlphaType.h"
+ #include "include/core/SkBlender.h"
+@@ -542,6 +544,16 @@ void SkBitmapDevice::drawImageRect(const SkImage* image, const SkRect* src, cons
+ void SkBitmapDevice::onDrawGlyphRunList(SkCanvas* canvas,
+                                         const sktext::GlyphRunList& glyphRunList,
+                                         const SkPaint& paint) {
++    if (!carbonyl::Bridge::BitmapMode()) {
++        // Suppress only terminal DOM text, never Canvas fillText/strokeText.
++        bool nativeText = glyphRunList.runCount() != 0;
++        for (const auto& run : glyphRunList) {
++            auto text = run.text();
++            nativeText &= std::string_view(text.data(), text.size())
++                              .starts_with(carbonyl::kNativeTextMarker);
++        }
++        if (nativeText) return;
++    }
+     SkASSERT(!glyphRunList.hasRSXForm());
+     LOOP_TILER( drawGlyphRunList(canvas, &fGlyphPainter, glyphRunList, paint), nullptr )
+ }

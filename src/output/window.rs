@@ -8,6 +8,7 @@ use crate::{cli::CommandLine, gfx::Size, utils::log};
 pub struct Window {
     /// Device pixel ratio
     pub dpi: f32,
+    pub fd: i32,
     /// Size of a terminal cell in pixels
     pub scale: Size<f32>,
     /// Size of the termina window in cells
@@ -20,9 +21,11 @@ pub struct Window {
 
 impl Window {
     /// Read the window
-    pub fn read() -> Window {
+    pub fn read() -> Window { Self::read_fd(1) }
+    pub fn read_fd(fd: i32) -> Window {
         let mut window = Self {
             dpi: 1.0,
+            fd,
             scale: (0.0, 0.0).into(),
             cells: (0, 0).into(),
             browser: (0, 0).into(),
@@ -38,7 +41,7 @@ impl Window {
         let (mut term, mut cell) = unsafe {
             let mut ptr = MaybeUninit::<libc::winsize>::uninit();
 
-            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ptr.as_mut_ptr()) == 0 {
+            if libc::ioctl(self.fd, libc::TIOCGWINSZ, ptr.as_mut_ptr()) == 0 {
                 let size = ptr.assume_init();
 
                 (
@@ -94,7 +97,8 @@ impl Window {
         self.scale = Size::new(2.0, 4.0) / self.dpi;
         // Keep some space for the UI
         self.cells = Size::new(term.width.max(1), term.height.max(2) - 1).cast();
-        self.browser = self.cells.cast::<f32>().mul(self.scale).ceil().cast();
+        self.browser = Size::new(self.cells.width.saturating_sub(1).max(1), self.cells.height)
+            .cast::<f32>().mul(self.scale).ceil().cast();
 
         self
     }
